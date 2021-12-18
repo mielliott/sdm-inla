@@ -1,0 +1,149 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(magrittr)
+library(sp)
+library(INLA)
+library(lattice)
+library(splancs)
+library(colorRamps)
+
+
+presence.file = "datasets/Achillea_gracilis_Georef_US.csv"
+max.num.absents = 5000
+image.scale = 12.0
+mesh.density = 5.0 # Triangulation gives about (650 * mesh.density) nodes
+
+```
+
+
+Get the USA boundaries in Cartesian space.
+
+```{r}
+usa.noncontig <- ne_countries(country = "united states of america", returnclass = "sp")
+usa.p.longlat <- usa.noncontig@polygons[[1]]@Polygons[[6]]
+
+# Project long-lats to XYZ
+usa.p <- usa.p.longlat
+usa.p@coords <- inla.mesh.map(usa.p.longlat@coords, projection = "longlat")
+
+# Compile as a polygon
+usa.ps <- Polygons(list(usa.p),1)
+usa.sps <- SpatialPolygons(list(usa.ps))
+plot(usa.sps)
+```
+
+Get occurrence data
+
+```{r}
+presence <- read.csv(presence.file)
+presence.longlat <- presence[, c("decimalLongitude", "decimalLatitude")]
+
+# Project long-lats to XYZ
+presence.cartesian = inla.mesh.map(presence.longlat, projection = "longlat")
+
+plot(presence.cartesian, pch=16,cex=0.4)
+```
+
+Simulate evenly-spaced absence points using Delaunay triangulation
+
+```{r}
+usa.bnd = inla.sp2segment(usa.sps)
+absence.mesh <- inla.mesh.2d(boundary = usa.bnd, cutoff = 0.001, max.edge = c(0.01), n = 4, offset = 0.01, max.n = max.num.absents)
+absence.cartesian = absence.mesh$loc
+absence.longlat = inla.mesh.map(absence.cartesian, projection = "longlat", inverse = FALSE)
+plot(absence.mesh)
+plot(absence.longlat, pch=16,cex=0.4)
+```
+
+Build Y
+
+```{r}
+pa.coords <- rbind(presence.cartesian, absence.cartesian)
+pa.values <- c(rep(1, nrow(presence.cartesian)), rep(0, nrow(absence.cartesian)))
+
+sdm.data <- data.frame(cbind(pa.values, rbind(presence.cartesian, absence.cartesian)))
+```
+
+Build a triangulation
+
+```{r}
+usa.bnd <- inla.sp2segment(usa.sps)
+usa.mesh <- inla.mesh.2d(boundary = inla.sp2segment(usa.sps), cutoff = .005 / mesh.density, max.edge = c(0.05, 0.5) / mesh.density)
+cat("Num nodes in triangulation:", length(usa.mesh$loc[,1]))
+#plot(usa.mesh)
+```
+
+Build mixed-effects model using INLA
+
+```{r}
+
+spde <- inla.spde2.matern(usa.mesh, alpha = 2)
+A <- inla.spde.make.A(usa.mesh, loc = pa.coords)
+# Q <- inla.spde2.precision(spde, theta = c(0, -1))
+# x <- inla.qsample(n = 1, Q, seed = 1235L)[, 1]
+
+stack <- inla.stack(
+  data = list(pa = sdm.data$pa.values),
+  A = A,
+  effect = list(
+    spatial = 1:spde$n.spde,
+    data.frame(a0 = 1)
+  )
+)
+
+model <- pa.values ~ a0 + f(spatial, model = spde)
+
+r1 <- inla(
+  model,
+  family = "poisson",
+  data = inla.stack.data(stack),
+  control.predictor = list(A = inla.stack.A(stack), link = 1),
+  verbose = TRUE,
+  Ntrials = 1,
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+summary(r1)
+
+r1.field <- inla.spde2.result(r1, 'spatial', spde, do.transf=TRUE)
+
+mean(r1$marginals.hy[[2]][,1])
+
+mean(r1.field$marginals.variance.nominal[[1]][,1])
+
+mean(r1.field$marginals.range.nominal[[1]][,1])
+
+```
+
+
+```{r}
+# Q <- inla.spde2.precision(spde, theta = c(0, -1))
+# x <- inla.qsample(n = 1, Q, seed = 1235L)[, 1]
+
+res = c(360 * image.scale + 1, 180 * image.scale + 1)
+projector <- inla.mesh.projector(usa.mesh, projection = "longlat", dims = res)
+
+g.mean_r1 <- inla.mesh.project(projector, r1$summary.random$spatial$mean)
+g.sd_r1 <- inla.mesh.project(projector, r1$summary.random$spatial$sd)
+
+lattice.longlat = inla.mesh.map(projector$lattice$loc, projection = "longlat", inverse = FALSE)
+table(xy.in <- inout(lattice.longlat, usa.p.longlat@coords))
+g.mean_r1[!xy.in] <- NA
+g.sd_r1[!xy.in] <- NA
+
+plotcenter = c(-96, 38)
+plotw = 60
+ploth = 30
+xrange = c(plotcenter[1] - plotw/2, plotcenter[1] + plotw/2)
+yrange = c(plotcenter[2] - ploth/2, plotcenter[2] + ploth/2)
+
+levelplot(g.mean_r1, aspect = ploth / plotw, xlim = xrange, ylim = yrange, xlab = "Longitude", ylab = "Latitude", row.values = projector$x, column.values = projector$y, col.regions = matlab.like2(64))
+levelplot(g.sd_r1, aspect = ploth / plotw, xlim = xrange, ylim = yrange, xlab = "Longitude", ylab = "Latitude", row.values = projector$x, column.values = projector$y, col.regions = matlab.like2(64))
+```
